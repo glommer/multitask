@@ -1,0 +1,19 @@
+[package]
+name = "multitask"
+version = "0.1.0"
+authors = ["Stjepan Glavina <stjepang@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-task = "3.0.0"
+concurrent-queue = "1.1.1"
+fastrand = "1.2.4"
+scoped-tls = "1.0.0"
+slab = "0.4.2"
+
+[dev-dependencies]
+blocking = "0.4.6"
+parking = "1.0.3"
+smol = "0.1.18"
