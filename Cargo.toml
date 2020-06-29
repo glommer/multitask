@@ -9,7 +9,7 @@ repository = "https://github.com/stjepang/multitask"
 homepage = "https://github.com/stjepang/multitask"
 documentation = "https://docs.rs/multitask"
 keywords = ["task", "spawn", "work", "stealing", "execute"]
-categories = ["asynchronous"]
+categories = ["asynchronous", "concurrency"]
 readme = "README.md"
 
 [dependencies]
