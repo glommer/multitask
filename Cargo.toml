@@ -3,6 +3,14 @@ name = "multitask"
 version = "0.1.0"
 authors = ["Stjepan Glavina <stjepang@gmail.com>"]
 edition = "2018"
+description = "An executor for running async tasks"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/stjepang/multitask"
+homepage = "https://github.com/stjepang/multitask"
+documentation = "https://docs.rs/multitask"
+keywords = ["task", "spawn", "work", "stealing", "execute"]
+categories = ["asynchronous"]
+readme = "README.md"
 
 [dependencies]
 async-task = "3.0.0"
@@ -12,6 +20,4 @@ scoped-tls = "1.0.0"
 slab = "0.4.2"
 
 [dev-dependencies]
-async-io = { path = "../async-io" }
-blocking = "0.4.6"
-parking = "1.0.3"
+async-io = "0.1.1"

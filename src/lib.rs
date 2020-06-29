@@ -1,3 +1,5 @@
+//! An executor for running async tasks.
+
 use std::cell::Cell;
 use std::future::Future;
 use std::marker::PhantomData;
