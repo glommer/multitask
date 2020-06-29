@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,9 +76,8 @@ impl<T> Task<T> {
     /// # Examples
     ///
     /// ```
+    /// use async_io::Timer;
     /// use multitask::Queue;
-    /// # // TODO: replace smol with async-io
-    /// use smol::Timer;
     /// use std::time::Duration;
     ///
     /// let queue = Queue::new();
@@ -86,7 +86,7 @@ impl<T> Task<T> {
     /// queue.spawn(async {
     ///     loop {
     ///         println!("I'm a daemon task looping forever.");
-    ///         Timer::after(Duration::from_secs(1)).await;
+    ///         Timer::new(Duration::from_secs(1)).await;
     ///     }
     /// })
     /// .detach();
@@ -106,9 +106,9 @@ impl<T> Task<T> {
     /// # Examples
     ///
     /// ```
+    /// use async_io::Timer;
+    /// use blocking::block_on;
     /// use multitask::Queue;
-    /// # // TODO: replace smol with async-io
-    /// use smol::Timer;
     /// use std::thread;
     /// use std::time::Duration;
     ///
@@ -118,7 +118,7 @@ impl<T> Task<T> {
     /// let task = queue.spawn(async {
     ///     loop {
     ///         println!("Even though I'm in an infinite loop, you can still cancel me!");
-    ///         Timer::after(Duration::from_secs(1)).await;
+    ///         Timer::new(Duration::from_secs(1)).await;
     ///     }
     /// });
     ///
@@ -133,9 +133,8 @@ impl<T> Task<T> {
     ///     }
     /// });
     ///
-    /// # // TODO: replace with blocking::block_on
-    /// smol::run(async {
-    ///     Timer::after(Duration::from_secs(3)).await;
+    /// block_on(async {
+    ///     Timer::new(Duration::from_secs(3)).await;
     ///     task.cancel().await;
     /// });
     /// ```
@@ -263,6 +262,9 @@ pub struct Queue {
     global: Arc<Global>,
 }
 
+impl UnwindSafe for Queue {}
+impl RefUnwindSafe for Queue {}
+
 impl Queue {
     /// Creates a new queue for spawning futures.
     pub fn new() -> Queue {
@@ -374,6 +376,9 @@ pub struct Worker {
     /// Make sure the type is `!Send` and `!Sync`.
     _marker: PhantomData<Rc<()>>,
 }
+
+impl UnwindSafe for Worker {}
+impl RefUnwindSafe for Worker {}
 
 impl Worker {
     /// Spawns a thread-local future onto this executor.
