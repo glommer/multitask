@@ -1,19 +1,20 @@
 //! An executor for running async tasks.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
+
 use std::cell::Cell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::fmt;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
-use std::thread::{self, ThreadId};
 
 use concurrent_queue::ConcurrentQueue;
-use scoped_tls::scoped_thread_local;
-use slab::Slab;
 
 /// A runnable future, ready for execution.
 ///
@@ -37,19 +38,19 @@ type Runnable = async_task::Task<()>;
 ///
 /// Tasks that panic get immediately canceled. Awaiting a canceled task also causes a panic.
 ///
-/// If a task panics, the panic will be thrown by the [`Worker::tick()`] invocation that polled it.
+/// If a task panics, the panic will be thrown by the [`Ticker::tick()`] invocation that polled it.
 ///
 /// # Examples
 ///
 /// ```
 /// use blocking::block_on;
-/// use multitask::Queue;
+/// use multitask::Executor;
 /// use std::thread;
 ///
-/// let queue = Queue::new();
+/// let ex = Executor::new();
 ///
-/// // Spawn a future onto the queue.
-/// let task = queue.spawn(async {
+/// // Spawn a future onto the executor.
+/// let task = ex.spawn(async {
 ///     println!("Hello from a task!");
 ///     1 + 2
 /// });
@@ -57,9 +58,9 @@ type Runnable = async_task::Task<()>;
 /// // Run an executor thread.
 /// thread::spawn(move || {
 ///     let (p, u) = parking::pair();
-///     let worker = queue.worker(move || u.unpark());
+///     let ticker = ex.ticker(move || u.unpark());
 ///     loop {
-///         if !worker.tick() {
+///         if !ticker.tick() {
 ///             p.park();
 ///         }
 ///     }
@@ -79,13 +80,13 @@ impl<T> Task<T> {
     ///
     /// ```
     /// use async_io::Timer;
-    /// use multitask::Queue;
+    /// use multitask::Executor;
     /// use std::time::Duration;
     ///
-    /// let queue = Queue::new();
+    /// let ex = Executor::new();
     ///
     /// // Spawn a deamon future.
-    /// queue.spawn(async {
+    /// ex.spawn(async {
     ///     loop {
     ///         println!("I'm a daemon task looping forever.");
     ///         Timer::new(Duration::from_secs(1)).await;
@@ -110,14 +111,14 @@ impl<T> Task<T> {
     /// ```
     /// use async_io::Timer;
     /// use blocking::block_on;
-    /// use multitask::Queue;
+    /// use multitask::Executor;
     /// use std::thread;
     /// use std::time::Duration;
     ///
-    /// let queue = Queue::new();
+    /// let ex = Executor::new();
     ///
     /// // Spawn a deamon future.
-    /// let task = queue.spawn(async {
+    /// let task = ex.spawn(async {
     ///     loop {
     ///         println!("Even though I'm in an infinite loop, you can still cancel me!");
     ///         Timer::new(Duration::from_secs(1)).await;
@@ -127,9 +128,9 @@ impl<T> Task<T> {
     /// // Run an executor thread.
     /// thread::spawn(move || {
     ///     let (p, u) = parking::pair();
-    ///     let worker = queue.worker(move || u.unpark());
+    ///     let ticker = ex.ticker(move || u.unpark());
     ///     loop {
-    ///         if !worker.tick() {
+    ///         if !ticker.tick() {
     ///             p.park();
     ///         }
     ///     }
@@ -167,27 +168,123 @@ impl<T> Future for Task<T> {
     }
 }
 
-scoped_thread_local! {
-    static WORKER: Worker
+/// A single-threaded executor.
+#[derive(Debug)]
+pub struct LocalExecutor {
+    /// The task queue.
+    queue: Arc<ConcurrentQueue<Runnable>>,
+
+    /// Callback invoked to wake the executor up.
+    callback: Callback,
+
+    /// Make sure the type is `!Send` and `!Sync`.
+    _marker: PhantomData<Rc<()>>,
 }
 
-/// State shared between [`Queue`] and [`Worker`].
+impl UnwindSafe for LocalExecutor {}
+impl RefUnwindSafe for LocalExecutor {}
+
+impl LocalExecutor {
+    /// Creates a new single-threaded executor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use multitask::LocalExecutor;
+    ///
+    /// let (p, u) = parking::pair();
+    /// let ex = LocalExecutor::new(move || u.unpark());
+    /// ```
+    pub fn new(notify: impl Fn() + Send + Sync + 'static) -> LocalExecutor {
+        LocalExecutor {
+            queue: Arc::new(ConcurrentQueue::unbounded()),
+            callback: Callback::new(notify),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Spawns a thread-local future onto this executor.
+    ///
+    /// Returns a [`Task`] handle for the spawned future.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use multitask::LocalExecutor;
+    ///
+    /// let (p, u) = parking::pair();
+    /// let ex = LocalExecutor::new(move || u.unpark());
+    ///
+    /// let task = ex.spawn(async { println!("hello") });
+    /// ```
+    pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Task<T> {
+        let queue = self.queue.clone();
+        let callback = self.callback.clone();
+
+        // The function that schedules a runnable task when it gets woken up.
+        let schedule = move |runnable| {
+            queue.push(runnable).unwrap();
+            callback.call();
+        };
+
+        // Create a task, push it into the queue by scheduling it, and return its `Task` handle.
+        let (runnable, handle) = async_task::spawn_local(future, schedule, ());
+        runnable.schedule();
+        Task(Some(handle))
+    }
+
+    /// Runs a single task and returns `true` if one was found.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use multitask::LocalExecutor;
+    ///
+    /// let (p, u) = parking::pair();
+    /// let ex = LocalExecutor::new(move || u.unpark());
+    ///
+    /// assert!(!ex.tick());
+    /// let task = ex.spawn(async { println!("hello") });
+    ///
+    /// // This prints "hello".
+    /// assert!(ex.tick());
+    /// ```
+    pub fn tick(&self) -> bool {
+        if let Ok(r) = self.queue.pop() {
+            r.run();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for LocalExecutor {
+    fn drop(&mut self) {
+        // TODO(stjepang): Close the local queue and empty it.
+        // TODO(stjepang): Cancel all remaining tasks.
+    }
+}
+
+/// State shared between [`Executor`] and [`Ticker`].
+#[derive(Debug)]
 struct Global {
     /// The global queue.
     queue: ConcurrentQueue<Runnable>,
 
-    /// Shards of the global queue created by workers.
-    shards: RwLock<Slab<Arc<ConcurrentQueue<Runnable>>>>,
+    /// Shards of the global queue created by tickers.
+    shards: RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>>,
 
-    /// Set to `true` when a sleeping worker is notified or no workers are sleeping.
+    /// Set to `true` when a sleeping ticker is notified or no tickers are sleeping.
     notified: AtomicBool,
 
-    /// A list of sleeping workers.
+    /// A list of sleeping tickers.
     sleepers: Mutex<Sleepers>,
 }
 
 impl Global {
-    /// Notifies a sleeping worker.
+    /// Notifies a sleeping ticker.
+    #[inline]
     fn notify(&self) {
         if !self
             .notified
@@ -201,27 +298,28 @@ impl Global {
     }
 }
 
-/// A list of sleeping workers.
+/// A list of sleeping tickers.
+#[derive(Debug)]
 struct Sleepers {
-    /// Number of sleeping workers (both notified and unnotified).
+    /// Number of sleeping tickers (both notified and unnotified).
     count: usize,
 
-    /// Callbacks of sleeping unnotified workers.
+    /// Callbacks of sleeping unnotified tickers.
     ///
-    /// A sleeping worker is notified when its callback is missing from this list.
+    /// A sleeping ticker is notified when its callback is missing from this list.
     callbacks: Vec<Callback>,
 }
 
 impl Sleepers {
-    /// Inserts a new sleeping worker.
+    /// Inserts a new sleeping ticker.
     fn insert(&mut self, callback: &Callback) {
         self.count += 1;
         self.callbacks.push(callback.clone());
     }
 
-    /// Re-inserts a sleeping worker's callback if it was notified.
+    /// Re-inserts a sleeping ticker's callback if it was notified.
     ///
-    /// Returns `true` if the worker was notified.
+    /// Returns `true` if the ticker was notified.
     fn update(&mut self, callback: &Callback) -> bool {
         if self.callbacks.iter().all(|cb| cb != callback) {
             self.callbacks.push(callback.clone());
@@ -231,7 +329,7 @@ impl Sleepers {
         }
     }
 
-    /// Removes a previously inserted sleeping worker.
+    /// Removes a previously inserted sleeping ticker.
     fn remove(&mut self, callback: &Callback) {
         self.count -= 1;
         for i in (0..self.callbacks.len()).rev() {
@@ -242,14 +340,14 @@ impl Sleepers {
         }
     }
 
-    /// Returns `true` if a sleeping worker is notified or no workers are sleeping.
+    /// Returns `true` if a sleeping ticker is notified or no tickers are sleeping.
     fn is_notified(&self) -> bool {
         self.count == 0 || self.count > self.callbacks.len()
     }
 
-    /// Returns notification callback for a sleeping worker.
+    /// Returns notification callback for a sleeping ticker.
     ///
-    /// If a worker was notified already or there are no workers, `None` will be returned.
+    /// If a ticker was notified already or there are no tickers, `None` will be returned.
     fn notify(&mut self) -> Option<Callback> {
         if self.callbacks.len() == self.count {
             self.callbacks.pop()
@@ -259,21 +357,30 @@ impl Sleepers {
     }
 }
 
-/// A queue for spawning futures.
-pub struct Queue {
+/// A multi-threaded executor.
+#[derive(Debug)]
+pub struct Executor {
     global: Arc<Global>,
 }
 
-impl UnwindSafe for Queue {}
-impl RefUnwindSafe for Queue {}
+impl UnwindSafe for Executor {}
+impl RefUnwindSafe for Executor {}
 
-impl Queue {
-    /// Creates a new queue for spawning futures.
-    pub fn new() -> Queue {
-        Queue {
+impl Executor {
+    /// Creates a new multi-threaded executor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use multitask::Executor;
+    ///
+    /// let ex = Executor::new();
+    /// ```
+    pub fn new() -> Executor {
+        Executor {
             global: Arc::new(Global {
                 queue: ConcurrentQueue::unbounded(),
-                shards: RwLock::new(Slab::new()),
+                shards: RwLock::new(Vec::new()),
                 notified: AtomicBool::new(true),
                 sleepers: Mutex::new(Sleepers {
                     count: 0,
@@ -283,9 +390,18 @@ impl Queue {
         }
     }
 
-    /// Spawns a future onto this queue.
+    /// Spawns a future onto this executor.
     ///
     /// Returns a [`Task`] handle for the spawned future.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use multitask::Executor;
+    ///
+    /// let ex = Executor::new();
+    /// let task = ex.spawn(async { println!("hello") });
+    /// ```
     pub fn spawn<T: Send + 'static>(
         &self,
         future: impl Future<Output = T> + Send + 'static,
@@ -294,20 +410,7 @@ impl Queue {
 
         // The function that schedules a runnable task when it gets woken up.
         let schedule = move |runnable| {
-            if WORKER.is_set() {
-                WORKER.with(|w| {
-                    if Arc::ptr_eq(&global, &w.global) {
-                        if let Err(err) = w.shard.push(runnable) {
-                            global.queue.push(err.into_inner()).unwrap();
-                        }
-                    } else {
-                        global.queue.push(runnable).unwrap();
-                    }
-                });
-            } else {
-                global.queue.push(runnable).unwrap();
-            }
-
+            global.queue.push(runnable).unwrap();
             global.notify();
         };
 
@@ -317,106 +420,92 @@ impl Queue {
         Task(Some(handle))
     }
 
-    /// Registers a new worker.
+    /// Creates a new ticker for executing tasks.
     ///
-    /// The worker will automatically deregister itself when dropped.
-    pub fn worker(&self, notify: impl Fn() + Send + Sync + 'static) -> Worker {
-        let mut shards = self.global.shards.write().unwrap();
-        let vacant = shards.vacant_entry();
-
-        // Create a worker and put its stealer handle into the executor.
-        let worker = Worker {
-            key: vacant.key(),
+    /// In a multi-threaded executor, each executor thread will create its own ticker and then keep
+    /// calling [`Ticker::tick()`] in a loop.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use blocking::block_on;
+    /// use multitask::Executor;
+    /// use std::thread;
+    ///
+    /// let ex = Executor::new();
+    ///
+    /// // Create two executor threads.
+    /// for _ in 0..2 {
+    ///     let (p, u) = parking::pair();
+    ///     let ticker = ex.ticker(move || u.unpark());
+    ///     thread::spawn(move || {
+    ///         loop {
+    ///             if !ticker.tick() {
+    ///                 p.park();
+    ///             }
+    ///         }
+    ///     });
+    /// }
+    ///
+    /// // Spawn a future and wait for one of the threads to run it.
+    /// let task = ex.spawn(async { 1 + 2 });
+    /// assert_eq!(block_on(task), 3);
+    /// ```
+    pub fn ticker(&self, notify: impl Fn() + Send + Sync + 'static) -> Ticker {
+        // Create a ticker and put its stealer handle into the executor.
+        let ticker = Ticker {
             global: Arc::new(self.global.clone()),
             shard: Arc::new(ConcurrentQueue::bounded(512)),
-            local: Arc::new(ConcurrentQueue::unbounded()),
             callback: Callback::new(notify),
             sleeping: Cell::new(false),
-            ticker: Cell::new(0),
-            _marker: PhantomData,
+            ticks: Cell::new(0),
         };
-        vacant.insert(worker.shard.clone());
-
-        worker
+        self.global
+            .shards
+            .write()
+            .unwrap()
+            .push(ticker.shard.clone());
+        ticker
     }
 }
 
-impl Default for Queue {
-    fn default() -> Queue {
-        Queue::new()
+impl Default for Executor {
+    fn default() -> Executor {
+        Executor::new()
     }
 }
 
-/// A worker for running tasks and spawning thread-local futures.
-pub struct Worker {
-    /// The ID of this worker obtained during registration.
-    key: usize,
-
+/// Runs tasks in a multi-threaded executor.
+#[derive(Debug)]
+pub struct Ticker {
     /// The global queue.
     global: Arc<Arc<Global>>,
 
     /// A shard of the global queue.
     shard: Arc<ConcurrentQueue<Runnable>>,
 
-    /// Local queue for `!Send` tasks.
-    local: Arc<ConcurrentQueue<Runnable>>,
-
-    /// Callback invoked to wake this worker up.
+    /// Callback invoked to wake this ticker up.
     callback: Callback,
 
     /// Set to `true` when in sleeping state.
     ///
-    /// States a worker can be in:
+    /// States a ticker can be in:
     /// 1) Woken.
     /// 2a) Sleeping and unnotified.
     /// 2b) Sleeping and notified.
     sleeping: Cell<bool>,
 
     /// Bumped every time a task is run.
-    ticker: Cell<usize>,
-
-    /// Make sure the type is `!Send` and `!Sync`.
-    _marker: PhantomData<Rc<()>>,
+    ticks: Cell<usize>,
 }
 
-impl UnwindSafe for Worker {}
-impl RefUnwindSafe for Worker {}
+impl UnwindSafe for Ticker {}
+impl RefUnwindSafe for Ticker {}
 
-impl Worker {
-    /// Spawns a thread-local future onto this executor.
+impl Ticker {
+    /// Moves the ticker into sleeping and unnotified state.
     ///
-    /// Returns a [`Task`] handle for the spawned future.
-    pub fn spawn_local<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Task<T> {
-        let local = self.local.clone();
-        let callback = self.callback.clone();
-        let id = thread_id();
-
-        // The function that schedules a runnable task when it gets woken up.
-        let schedule = move |runnable| {
-            if thread_id() == id && WORKER.is_set() {
-                WORKER.with(|w| {
-                    if Arc::ptr_eq(&local, &w.local) {
-                        w.local.push(runnable).unwrap();
-                    } else {
-                        local.push(runnable).unwrap();
-                    }
-                });
-            } else {
-                local.push(runnable).unwrap();
-            }
-
-            callback.call();
-        };
-
-        // Create a task, push it into the queue by scheduling it, and return its `Task` handle.
-        let (runnable, handle) = async_task::spawn_local(future, schedule, ());
-        runnable.schedule();
-        Task(Some(handle))
-    }
-
-    /// Moves the worker into sleeping and unnotified state.
-    ///
-    /// Returns `false` if the worker was already sleeping and unnotified.
+    /// Returns `false` if the ticker was already sleeping and unnotified.
     fn sleep(&self) -> bool {
         let mut sleepers = self.global.sleepers.lock().unwrap();
 
@@ -438,9 +527,9 @@ impl Worker {
         true
     }
 
-    /// Moves the worker into woken state.
+    /// Moves the ticker into woken state.
     ///
-    /// Returns `false` if the worker was already woken.
+    /// Returns `false` if the ticker was already woken.
     fn wake(&self) -> bool {
         if self.sleeping.get() {
             let mut sleepers = self.global.sleepers.lock().unwrap();
@@ -469,21 +558,21 @@ impl Worker {
                     // Wake up.
                     self.wake();
 
-                    // Notify another worker now to pick up where this worker left off, just in
+                    // Notify another ticker now to pick up where this ticker left off, just in
                     // case running the task takes a long time.
                     self.global.notify();
 
                     // Bump the ticker.
-                    let ticker = self.ticker.get();
-                    self.ticker.set(ticker.wrapping_add(1));
+                    let ticks = self.ticks.get();
+                    self.ticks.set(ticks.wrapping_add(1));
 
                     // Steal tasks from the global queue to ensure fair task scheduling.
-                    if ticker % 64 == 0 {
+                    if ticks % 64 == 0 {
                         steal(&self.global.queue, &self.shard);
                     }
 
                     // Run the task.
-                    WORKER.set(self, || r.run());
+                    r.run();
 
                     return true;
                 }
@@ -493,21 +582,13 @@ impl Worker {
 
     /// Finds the next task to run.
     fn search(&self) -> Option<Runnable> {
-        if self.ticker.get() % 2 == 0 {
-            // On even ticks, look into the local queue and then into the shard.
-            if let Ok(r) = self.local.pop().or_else(|_| self.shard.pop()) {
-                return Some(r);
-            }
-        } else {
-            // On odd ticks, look into the shard and then into the local queue.
-            if let Ok(r) = self.shard.pop().or_else(|_| self.local.pop()) {
-                return Some(r);
-            }
+        if let Ok(r) = self.shard.pop() {
+            return Some(r);
         }
 
         // Try stealing from the global queue.
-        steal(&self.global.queue, &self.shard);
-        if let Ok(r) = self.shard.pop() {
+        if let Ok(r) = self.global.queue.pop() {
+            steal(&self.global.queue, &self.shard);
             return Some(r);
         }
 
@@ -519,9 +600,8 @@ impl Worker {
         let start = fastrand::usize(..n);
         let iter = shards.iter().chain(shards.iter()).skip(start).take(n);
 
-        // Remove this worker's shard.
-        let iter = iter.filter(|(key, _)| *key != self.key);
-        let iter = iter.map(|(_, shard)| shard);
+        // Remove this ticker's shard.
+        let iter = iter.filter(|shard| !Arc::ptr_eq(shard, &self.shard));
 
         // Try stealing from each shard in the list.
         for shard in iter {
@@ -535,25 +615,28 @@ impl Worker {
     }
 }
 
-impl Drop for Worker {
+impl Drop for Ticker {
     fn drop(&mut self) {
-        // Wake and unregister the worker.
+        // Wake and unregister the ticker.
         self.wake();
-        self.global.shards.write().unwrap().remove(self.key);
+        self.global
+            .shards
+            .write()
+            .unwrap()
+            .retain(|shard| !Arc::ptr_eq(shard, &self.shard));
 
         // Re-schedule remaining tasks in the shard.
         while let Ok(r) = self.shard.pop() {
             r.schedule();
         }
-        // Notify another worker to start searching for tasks.
+        // Notify another ticker to start searching for tasks.
         self.global.notify();
 
-        // TODO(stjepang): Close the local queue and empty it.
         // TODO(stjepang): Cancel all remaining tasks.
     }
 }
 
-/// Steals some from one queue into another.
+/// Steals some items from one queue into another.
 fn steal<T>(src: &ConcurrentQueue<T>, dest: &ConcurrentQueue<T>) {
     // Half of `src`'s length rounded up.
     let mut count = (src.len() + 1) / 2;
@@ -573,16 +656,6 @@ fn steal<T>(src: &ConcurrentQueue<T>, dest: &ConcurrentQueue<T>) {
             }
         }
     }
-}
-
-/// Same as `std::thread::current().id()`, but more efficient.
-fn thread_id() -> ThreadId {
-    thread_local! {
-        static ID: ThreadId = thread::current().id();
-    }
-
-    ID.try_with(|id| *id)
-        .unwrap_or_else(|_| thread::current().id())
 }
 
 /// A cloneable callback function.
@@ -606,3 +679,10 @@ impl PartialEq for Callback {
 }
 
 impl Eq for Callback {}
+
+impl fmt::Debug for Callback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("<callback>")
+            .finish()
+    }
+}

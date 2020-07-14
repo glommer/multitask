@@ -16,8 +16,6 @@ readme = "README.md"
 async-task = "3.0.0"
 concurrent-queue = "1.1.1"
 fastrand = "1.2.4"
-scoped-tls = "1.0.0"
-slab = "0.4.2"
 
 [dev-dependencies]
 async-io = "0.1.1"
