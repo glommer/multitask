@@ -3,18 +3,20 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::fmt;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 
+use cache_padded::CachePadded;
 use concurrent_queue::ConcurrentQueue;
+use thread_local::ThreadLocal;
 
 /// A runnable future, ready for execution.
 ///
@@ -280,6 +282,8 @@ struct Global {
 
     /// A list of sleeping tickers.
     sleepers: Mutex<Sleepers>,
+
+    current: CachePadded<ThreadLocal<RefCell<Option<(Arc<ConcurrentQueue<Runnable>>, Callback)>>>>,
 }
 
 impl Global {
@@ -386,6 +390,7 @@ impl Executor {
                     count: 0,
                     callbacks: Vec::new(),
                 }),
+                current: CachePadded::new(ThreadLocal::new()),
             }),
         }
     }
@@ -410,6 +415,14 @@ impl Executor {
 
         // The function that schedules a runnable task when it gets woken up.
         let schedule = move |runnable| {
+            if let Some(current) = global.current.get() {
+                if let Some((shard, callback)) = &*current.borrow() {
+                    shard.push(runnable).unwrap();
+                    callback.call();
+                    return;
+                }
+            }
+
             global.queue.push(runnable).unwrap();
             global.notify();
         };
@@ -465,6 +478,8 @@ impl Executor {
             .write()
             .unwrap()
             .push(ticker.shard.clone());
+        *self.global.current.get_or_default().borrow_mut() =
+            Some((ticker.shard.clone(), ticker.callback.clone()));
         ticker
     }
 }
@@ -624,6 +639,7 @@ impl Drop for Ticker {
             .write()
             .unwrap()
             .retain(|shard| !Arc::ptr_eq(shard, &self.shard));
+        self.global.current.get_or_default().borrow_mut().take();
 
         // Re-schedule remaining tasks in the shard.
         while let Ok(r) = self.shard.pop() {
@@ -682,7 +698,6 @@ impl Eq for Callback {}
 
 impl fmt::Debug for Callback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("<callback>")
-            .finish()
+        f.debug_struct("<callback>").finish()
     }
 }
