@@ -414,12 +414,16 @@ impl Executor {
         let global = self.global.clone();
 
         // The function that schedules a runnable task when it gets woken up.
-        let schedule = move |runnable| {
+        let schedule = move |mut runnable| {
             if let Some(current) = global.current.get() {
                 if let Some((shard, callback)) = &*current.borrow() {
-                    shard.push(runnable).unwrap();
-                    callback.call();
-                    return;
+                    match shard.push(runnable) {
+                        Ok(()) => {
+                            callback.call();
+                            return;
+                        }
+                        Err(err) => runnable = err.into_inner(),
+                    }
                 }
             }
 
