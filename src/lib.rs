@@ -454,7 +454,7 @@ impl Executor {
     pub fn ticker(&self, notify: impl Fn() + Send + Sync + 'static) -> Ticker {
         // Create a ticker and put its stealer handle into the executor.
         let ticker = Ticker {
-            global: Arc::new(self.global.clone()),
+            global: self.global.clone(),
             shard: Arc::new(ConcurrentQueue::bounded(512)),
             callback: Callback::new(notify),
             sleeping: Cell::new(false),
@@ -479,7 +479,7 @@ impl Default for Executor {
 #[derive(Debug)]
 pub struct Ticker {
     /// The global queue.
-    global: Arc<Arc<Global>>,
+    global: Arc<Global>,
 
     /// A shard of the global queue.
     shard: Arc<ConcurrentQueue<Runnable>>,
