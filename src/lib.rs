@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
+use std::cell::RefCell;
 use std::cell::Cell;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 
-use concurrent_queue::ConcurrentQueue;
+use concurrent_queue::{ConcurrentQueue, PopError};
 
 /// A runnable future, ready for execution.
 ///
@@ -168,11 +169,72 @@ impl<T> Future for Task<T> {
     }
 }
 
+/// An opaque handler indicating in which queue a group of tasks will execute.
+/// Tasks in the same group will execute in FIFO order but no guarantee is made
+/// about ordering on different task queues.
+#[derive(Debug, Copy, Clone)]
+pub struct TaskQueueHandle {
+    index: usize,
+}
+
+impl TaskQueueHandle {
+    fn from_index(index : usize) -> TaskQueueHandle {
+        TaskQueueHandle {
+            index,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueueState {
+    /// The task queue.
+    queue: Vec<Arc<ConcurrentQueue<Runnable>>>,
+    last_queue: usize,
+}
+
+impl QueueState {
+    fn new() -> QueueState {
+        QueueState {
+            queue: vec![Arc::new(ConcurrentQueue::unbounded())],
+            last_queue : 0,
+        }
+    }
+
+    fn get(&self, handle: TaskQueueHandle) -> Option<Arc<ConcurrentQueue<Runnable>>> {
+        if handle.index >= self.queue.len() {
+            return None
+        }
+        Some(self.queue[handle.index].clone())
+    }
+
+    fn create_queue(&mut self) -> TaskQueueHandle {
+        self.queue.push(Arc::new(ConcurrentQueue::unbounded()));
+        let index = self.queue.len() - 1;
+        println!("Created new queue, index {}", index);
+        TaskQueueHandle {
+            index,
+        }
+    }
+
+    fn pick_task(&mut self) -> Result<Runnable, PopError> {
+        for queue in 0..self.queue.len() {
+            let handle = {
+                let q = self.last_queue + queue;
+                self.last_queue += 1;
+                q
+            } % self.queue.len();
+            if let Ok(r) = self.queue[handle].pop() {
+                return Ok(r);
+            }
+        }
+        Err(PopError::Empty)
+    }
+}
+
 /// A single-threaded executor.
 #[derive(Debug)]
 pub struct LocalExecutor {
-    /// The task queue.
-    queue: Arc<ConcurrentQueue<Runnable>>,
+    task_queues: RefCell<QueueState>,
 
     /// Callback invoked to wake the executor up.
     callback: Callback,
@@ -197,10 +259,33 @@ impl LocalExecutor {
     /// ```
     pub fn new(notify: impl Fn() + Send + Sync + 'static) -> LocalExecutor {
         LocalExecutor {
-            queue: Arc::new(ConcurrentQueue::unbounded()),
+            task_queues: RefCell::new(QueueState::new()),
             callback: Callback::new(notify),
             _marker: PhantomData,
         }
+    }
+
+    /// Creates a new task queue.
+    ///
+    /// Later tasks can be spawn into this task queue with spawn_into
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use multitask::LocalExecutor;
+    ///
+    /// let (p, u) = parking::pair();
+    /// let ex = LocalExecutor::new(move || u.unpark());
+    ///
+    /// let handle_reads = ex.create_task_queue();
+    /// let handle_writes = ex.create_task_queue();
+    ///
+    /// let task_reads = ex.spawn_into(async { println!("hello") }, handle_reads).unwrap();
+    /// let task_writes = ex.spawn_into(async { println!("hello") }, handle_writes).unwrap();
+    /// ```
+    pub fn create_task_queue(&self) -> TaskQueueHandle {
+        let mut tq = self.task_queues.borrow_mut();
+        tq.create_queue()
     }
 
     /// Spawns a thread-local future onto this executor.
@@ -218,19 +303,45 @@ impl LocalExecutor {
     /// let task = ex.spawn(async { println!("hello") });
     /// ```
     pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Task<T> {
-        let queue = self.queue.clone();
-        let callback = self.callback.clone();
+        self.spawn_into(future, TaskQueueHandle::from_index(0)).unwrap()
+    }
 
-        // The function that schedules a runnable task when it gets woken up.
-        let schedule = move |runnable| {
-            queue.push(runnable).unwrap();
-            callback.call();
-        };
+    /// Spawns a thread-local future onto this executor, into a particular queue.
+    ///
+    /// Returns an Option with the Some value containing a [`Task`] handle for the spawned future, or None if there is no such queue.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use multitask::LocalExecutor;
+    ///
+    /// let (p, u) = parking::pair();
+    /// let ex = LocalExecutor::new(move || u.unpark());
+    ///
+    /// let handle_reads = ex.create_task_queue();
+    /// let handle_writes = ex.create_task_queue();
+    ///
+    /// let task_reads = ex.spawn_into(async { println!("hello") }, handle_reads).unwrap();
+    /// let task_writes = ex.spawn_into(async { println!("hello") }, handle_writes).unwrap();
+    /// ```
+    pub fn spawn_into<T: 'static>(&self, future: impl Future<Output = T> + 'static, queue_handle: TaskQueueHandle) -> Option<Task<T>> {
+        let tq = self.task_queues.borrow();
+        if let Some(queue) = tq.get(queue_handle) {
+            let queue = queue.clone();
+            let callback = self.callback.clone();
 
-        // Create a task, push it into the queue by scheduling it, and return its `Task` handle.
-        let (runnable, handle) = async_task::spawn_local(future, schedule, ());
-        runnable.schedule();
-        Task(Some(handle))
+            // The function that schedules a runnable task when it gets woken up.
+            let schedule = move |runnable| {
+                queue.push(runnable).unwrap();
+                callback.call();
+            };
+
+            // Create a task, push it into the queue by scheduling it, and return its `Task` handle.
+            let (runnable, handle) = async_task::spawn_local(future, schedule, ());
+            runnable.schedule();
+            return Some(Task(Some(handle)))
+        }
+        None
     }
 
     /// Runs a single task and returns `true` if one was found.
@@ -250,11 +361,10 @@ impl LocalExecutor {
     /// assert!(ex.tick());
     /// ```
     pub fn tick(&self) -> bool {
-        if let Ok(r) = self.queue.pop() {
-            r.run();
-            true
-        } else {
-            false
+        let runnable = self.task_queues.borrow_mut().pick_task();
+        match runnable {
+            Ok(r) => { r.run(); true },
+            Err(_) => false,
         }
     }
 }
